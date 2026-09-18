@@ -5,7 +5,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <memory>
+#include <new>
 #include <vector>
 
 /* -----------------------------------------------------------------------
@@ -70,11 +72,26 @@ adaptq_ctx_t adaptq_create(int dim, int bits, int capacity, uint64_t seed,
     set_error(ADAPTQ_ERR_INVALID_ARG, "adaptq_create: bits must be 2, 3, or 4");
     return nullptr;
   }
-  auto *ctx = new AdapTQCtx();
-  ctx->dim = dim;
-  ctx->hybrid_thresh = hybrid_thresh;
-  ctx->head.init(dim, bits, capacity, seed, v_mass);
-  return ctx;
+
+  try {
+    auto ctx = std::make_unique<AdapTQCtx>();
+    ctx->dim = dim;
+    ctx->hybrid_thresh = hybrid_thresh;
+    ctx->head.init(dim, bits, capacity, seed, v_mass);
+    return ctx.release();
+  } catch (const std::bad_alloc &) {
+    set_error(ADAPTQ_ERR_ALLOC, "adaptq_create: memory allocation failed");
+    return nullptr;
+  } catch (const std::exception &e) {
+    char message[256];
+    snprintf(message, sizeof(message), "adaptq_create: %s", e.what());
+    set_error(ADAPTQ_ERR_INVALID_ARG, message);
+    return nullptr;
+  } catch (...) {
+    set_error(ADAPTQ_ERR_INVALID_ARG,
+              "adaptq_create: unknown initialization failure");
+    return nullptr;
+  }
 }
 
 void adaptq_destroy(adaptq_ctx_t h) {
@@ -161,13 +178,27 @@ adaptq_mha_t adaptq_mha_create(int n_heads, int dim, int bits, int capacity,
     set_error(ADAPTQ_ERR_INVALID_ARG, "adaptq_mha_create: bits must be 2, 3, or 4");
     return nullptr;
   }
-  auto *mha = new AdapTQMHA();
+  auto *mha = new (std::nothrow) AdapTQMHA();
+  if (!mha) {
+    set_error(ADAPTQ_ERR_ALLOC, "adaptq_mha_create: allocation failed");
+    return nullptr;
+  }
   mha->n_heads = n_heads;
-  mha->heads.resize(n_heads);
+  mha->heads.resize(n_heads, nullptr);
   for (int i = 0; i < n_heads; ++i) {
     uint64_t seed = base_seed ^ ((uint64_t)i * 0xDEADBEEFCAFEULL);
     mha->heads[i] = static_cast<AdapTQCtx *>(
         adaptq_create(dim, bits, capacity, seed, v_mass, hybrid_thresh));
+    if (!mha->heads[i]) {
+      for (int j = 0; j < i; ++j) {
+        if (mha->heads[j]) {
+          adaptq_destroy(mha->heads[j]);
+        }
+      }
+      delete mha;
+      set_error(ADAPTQ_ERR_ALLOC, "adaptq_mha_create: head allocation failed");
+      return nullptr;
+    }
   }
   return mha;
 }
@@ -177,8 +208,10 @@ void adaptq_mha_destroy(adaptq_mha_t h) {
     return;
 
   auto *mha = static_cast<AdapTQMHA *>(h);
-  for (auto *ctx : mha->heads)
-    delete ctx;
+  for (auto *ctx : mha->heads) {
+    if (ctx)
+      adaptq_destroy(ctx);
+  }
   delete mha;
 }
 
@@ -198,6 +231,10 @@ void adaptq_mha_append(adaptq_mha_t h, int head_idx, const float *key,
     return;
   }
 
+  if (!mha->heads[head_idx]) {
+    set_error(ADAPTQ_ERR_INVALID_ARG, "adaptq_mha_append: uninitialized head");
+    return;
+  }
   tl_error_buf[0] = '\0';
   adaptq_append(mha->heads[head_idx], key, val, token_pos);
 }
@@ -218,6 +255,10 @@ int adaptq_mha_compute(adaptq_mha_t h, int head_idx, const float *query,
     return -1;
   }
 
+  if (!mha->heads[head_idx]) {
+    set_error(ADAPTQ_ERR_INVALID_ARG, "adaptq_mha_compute: uninitialized head");
+    return -1;
+  }
   tl_error_buf[0] = '\0';
   return adaptq_compute(mha->heads[head_idx], query, out);
 }
@@ -244,6 +285,10 @@ int adaptq_mha_compute_batch(adaptq_mha_t h, int head_idx, const float *queries,
     return -1;
   }
 
+  if (!mha->heads[head_idx]) {
+    set_error(ADAPTQ_ERR_INVALID_ARG, "adaptq_mha_compute_batch: uninitialized head");
+    return -1;
+  }
   tl_error_buf[0] = '\0';
   return adaptq_compute_batch(mha->heads[head_idx], queries, num_queries, outs);
 }
@@ -253,8 +298,10 @@ void adaptq_mha_reset(adaptq_mha_t h) {
     return;
 
   auto *mha = static_cast<AdapTQMHA *>(h);
-  for (auto *ctx : mha->heads)
-    adaptq_reset(ctx);
+  for (auto *ctx : mha->heads) {
+    if (ctx)
+      adaptq_reset(ctx);
+  }
 }
 
 size_t adaptq_mha_total_kv_bytes(adaptq_mha_t h) {
@@ -263,8 +310,10 @@ size_t adaptq_mha_total_kv_bytes(adaptq_mha_t h) {
 
   auto *mha = static_cast<AdapTQMHA *>(h);
   size_t total = 0;
-  for (auto *ctx : mha->heads)
-    total += ctx->head.kv_bytes();
+  for (auto *ctx : mha->heads) {
+    if (ctx)
+      total += ctx->head.kv_bytes();
+  }
   return total;
 }
 

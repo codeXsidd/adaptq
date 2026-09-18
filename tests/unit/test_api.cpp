@@ -8,7 +8,7 @@
 /* -------------------------------------------------------------------------
  * tests/unit/test_api.cpp
  * C ABI smoke tests — covers every public function in adaptq.h.
- * ------------------------------------------------------------------------- */
+ * ----------------------------------------------------------------------- */
 
 static void fill_vec(float *v, int n, float val) {
     for (int i = 0; i < n; ++i) v[i] = val;
@@ -97,6 +97,21 @@ TEST_CASE("adaptq_create with invalid parameters returns null", "[api][security]
     REQUIRE(adaptq_create(128, 4, -1, 42, 0.f, 0) == nullptr);
     REQUIRE(adaptq_create(128, 4, 1024, 42, 0.f, -100) == nullptr);
     REQUIRE(std::string(adaptq_last_error()).size() > 0);
+}
+
+TEST_CASE("adaptq_create rejects unsupported quantization bit widths", "[api][security]") {
+    for (int bits : {1, 5, 6, 8, 16}) {
+        REQUIRE(adaptq_create(128, bits, 1024, 42, 0.f, 0) == nullptr);
+        REQUIRE(std::string(adaptq_last_error()).size() > 0);
+    }
+}
+
+TEST_CASE("adaptq_create accepts all supported quantization bit widths", "[api]") {
+    for (int bits : {2, 3, 4}) {
+        adaptq_ctx_t h = adaptq_create(128, bits, 1024, 42, 0.f, 0);
+        REQUIRE(h != nullptr);
+        adaptq_destroy(h);
+    }
 }
 
 TEST_CASE("single-head API rejects null handles and buffers without crashing", "[api][security]") {
@@ -195,6 +210,21 @@ TEST_CASE("adaptq_mha_create with invalid parameters returns null", "[api][mha][
     REQUIRE(adaptq_mha_create(4, 0, 4, 1024, 0, 0.f, 0) == nullptr);
     REQUIRE(adaptq_mha_create(4, 128, -1, 1024, 0, 0.f, 0) == nullptr);
     REQUIRE(std::string(adaptq_last_error()).size() > 0);
+}
+
+TEST_CASE("adaptq_mha_create rejects unsupported quantization bit widths", "[api][mha][security]") {
+    for (int bits : {1, 5, 6, 8, 16}) {
+        REQUIRE(adaptq_mha_create(4, 128, bits, 1024, 0, 0.f, 0) == nullptr);
+        REQUIRE(std::string(adaptq_last_error()).size() > 0);
+    }
+}
+
+TEST_CASE("adaptq_mha_create accepts all supported quantization bit widths", "[api][mha]") {
+    for (int bits : {2, 3, 4}) {
+        adaptq_mha_t mha = adaptq_mha_create(4, 128, bits, 1024, 0, 0.f, 0);
+        REQUIRE(mha != nullptr);
+        adaptq_mha_destroy(mha);
+    }
 }
 
 TEST_CASE("adaptq_mha_append: exact upper bound head_idx sets error", "[api][mha][security]") {
@@ -323,4 +353,67 @@ TEST_CASE("Max-Lloyd codebooks handle boundary conditions and outlier vectors wi
     REQUIRE(n == 3);
 
     adaptq_destroy(h);
+}
+
+/* ---- Flat Buffer & Aligned Allocator Safety (Issue #52) --------------- */
+#include "../../include/ring_buffer.h"
+
+TEST_CASE("AlignedAllocator throws std::bad_alloc on huge allocation request", "[allocator][safety]") {
+    AlignedAllocator<uint8_t, 64> alloc;
+    REQUIRE_THROWS_AS(alloc.allocate(size_t(-1) / 2), std::bad_alloc);
+}
+
+TEST_CASE("KVFlatBuffer handles initialization, insert, and cleanup safely", "[cache][flatbuffer]") {
+    KVFlatBuffer buf;
+    buf.init(16, 64, 4);
+    REQUIRE(buf.capacity == 16);
+    REQUIRE(buf.size == 0);
+    REQUIRE(buf.k_data != nullptr);
+    REQUIRE(buf.v_data != nullptr);
+
+    std::vector<uint8_t> dummy_k(buf.packed_bytes, 0x12);
+    std::vector<uint8_t> dummy_v(buf.packed_bytes, 0x34);
+
+    int idx = buf.insert(dummy_k.data(), 1.0f, dummy_v.data(), 2.0f, 0);
+    REQUIRE(idx == 0);
+    REQUIRE(buf.size == 1);
+    REQUIRE(buf.k_ptr(0)[0] == 0x12);
+    REQUIRE(buf.v_ptr(0)[0] == 0x34);
+    REQUIRE(buf.kv_bytes() == (size_t)buf.packed_bytes * 2);
+
+    buf.free_aligned();
+    REQUIRE(buf.k_data == nullptr);
+    REQUIRE(buf.v_data == nullptr);
+}
+
+/* ---- Softmax Numerical Stability Tests (Issue #58) -------------------- */
+#include "../../include/attention.h"
+
+TEST_CASE("softmax handles empty, null, single element, and zero-sum safely", "[attention][softmax][stability]") {
+    // Null and empty
+    softmax(nullptr, 10);
+    float dummy = 5.0f;
+    softmax(&dummy, 0);
+    softmax(&dummy, -1);
+
+    // Single element
+    float single[1] = { 42.0f };
+    softmax(single, 1);
+    REQUIRE(single[0] == 1.0f);
+
+    // Normal multi-element
+    float arr[3] = { 1.0f, 2.0f, 3.0f };
+    softmax(arr, 3);
+    float sum = arr[0] + arr[1] + arr[2];
+    REQUIRE(std::abs(sum - 1.0f) < 1e-5f);
+    REQUIRE(arr[2] > arr[1]);
+    REQUIRE(arr[1] > arr[0]);
+
+    // Extreme negative logits resulting in zero-sum underflow
+    float extreme[3] = { -1e30f, -1e30f, -1e30f };
+    softmax(extreme, 3);
+    // Should fall back to uniform distribution
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(std::abs(extreme[i] - (1.0f / 3.0f)) < 1e-5f);
+    }
 }
